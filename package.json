@@ -1,0 +1,12 @@
+{
+  "name": "kakao-skill-server",
+  "version": "1.0.0",
+  "description": "카카오 오픈빌더 상담 접수 스킬 서버",
+  "main": "skill-server.js",
+  "scripts": {
+    "start": "node skill-server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
