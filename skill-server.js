@@ -1,6 +1,6 @@
 // ============================================
 // 카카오 오픈빌더 스킬 서버
-// 기능: 상담 접수 양식 검증 + 구글 시트 저장
+// 기능: 엄격한 상담 접수 양식 검증 + 구글 시트 저장
 // 구글 시트 ID: 1fSElgikFPF1Er-SeK4AiCe5FwsKlYeYkE_j7oi7W0UI
 // ============================================
 
@@ -13,53 +13,56 @@ const GOOGLE_SCRIPT_URL = process.env.GOOGLE_SCRIPT_URL || '';
 const PORT = process.env.PORT || 3000;
 
 // ============================================
-// 1. 접수 양식 파싱 함수
+// 1. 접수 양식 파싱 함수 (강제 검증 적용)
 // ============================================
 function parseInquiry(text) {
   const result = {
     name: null,
+    business: null, // 상호명 필드 추가
     phone: null,
     content: null,
     isValid: false,
   };
 
-  // 수정: 전화번호 패턴 강화 (010/011/016/017/018/019 휴대폰 + 지역번호)
-  const phonePattern = /01[016789]-?\d{3,4}-?\d{4}|0[2-9]\d?-?\d{3,4}-?\d{4}/;
-  const lines = text.split(/[\n,]/).map(l => l.trim()).filter(Boolean);
+  // 줄바꿈 기준으로 텍스트 분리
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  let contentLines = [];
+  let isContentParsing = false;
 
   for (const line of lines) {
-    if (/이름|상호|업체|성함/.test(line)) {
-      result.name = line.replace(/.*?[：:]\s*/, '').trim();
-    } else if (/연락처|전화|번호/i.test(line)) {
-      result.phone = line.replace(/.*?[：:]\s*/, '').trim();
-    } else if (/상담|문의|내용/.test(line)) {
-      // 수정: 상담내용 키워드가 있으면 해당 줄부터 끝까지 합치기
-      const idx = lines.indexOf(line);
-      result.content = lines.slice(idx).map(l => l.replace(/.*?[：:]\s*/, '')).join(' ').trim();
-      break;
+    // 지정된 키워드와 콜론(:)이 앞부분에 정확히 있는지 정규식으로 검증
+    if (line.match(/^이름\s*[:：]/)) {
+      result.name = line.replace(/^이름\s*[:：]\s*/, '').trim();
+      isContentParsing = false;
+    } else if (line.match(/^상호명\s*[:：]/)) {
+      result.business = line.replace(/^상호명\s*[:：]\s*/, '').trim();
+      isContentParsing = false;
+    } else if (line.match(/^연락처\s*[:：]/)) {
+      result.phone = line.replace(/^연락처\s*[:：]\s*/, '').trim();
+      isContentParsing = false;
+    } else if (line.match(/^상담내용\s*[:：]/)) {
+      contentLines.push(line.replace(/^상담내용\s*[:：]\s*/, '').trim());
+      isContentParsing = true;
+    } else if (isContentParsing) {
+      // '상담내용:' 이후에 입력된 줄바꿈 내용들은 모두 본문에 이어붙임
+      contentLines.push(line);
     }
   }
 
-  // 키워드 없이 순서대로 입력한 경우 보완
-  if (!result.name && lines[0] && !phonePattern.test(lines[0])) {
-    result.name = lines[0];
-  }
-  if (!result.phone) {
-    const m = text.match(phonePattern);
-    if (m) result.phone = m[0];
-  }
-  // 수정: 3번째 줄 이후 전부 합치기 (기존엔 마지막 줄만 가져옴)
-  if (!result.content && lines.length >= 3) {
-    result.content = lines.slice(2).join(' ');
-  }
+  result.content = contentLines.join('\n').trim();
 
-  result.isValid = !!(result.name && result.phone && result.content);
+  // 전화번호 패턴 검증 (기존 로직 유지)
+  const phonePattern = /01[016789]-?\d{3,4}-?\d{4}|0[2-9]\d?-?\d{3,4}-?\d{4}/;
+  const isPhoneValid = result.phone && phonePattern.test(result.phone);
+
+  // 4가지 항목이 모두 빈칸 없이 입력되었고, 연락처 형식이 맞을 때만 유효한 것으로 처리
+  result.isValid = !!(result.name && result.business && result.phone && isPhoneValid && result.content);
+  
   return result;
 }
 
 // ============================================
 // 2. 구글 시트 저장 함수 (Apps Script 웹훅 호출)
-// 수정: 302 리다이렉트 자동 처리 + 타임아웃 4초
 // ============================================
 function saveToSheet(data) {
   return new Promise((resolve, reject) => {
@@ -87,7 +90,6 @@ function saveToSheet(data) {
       };
 
       const req = https.request(options, (res) => {
-        // 수정: 302 리다이렉트 → Location 헤더로 재요청
         if ((res.statusCode === 301 || res.statusCode === 302) && res.headers.location) {
           console.log('[리다이렉트]', res.statusCode, '→', res.headers.location);
           return doRequest(res.headers.location, attempt + 1);
@@ -101,7 +103,6 @@ function saveToSheet(data) {
         });
       });
 
-      // 수정: 4초 타임아웃 (카카오 5초 제한 대응)
       req.setTimeout(4000, () => {
         console.warn('[타임아웃] 구글 시트 저장 요청 4초 초과');
         req.destroy();
@@ -151,36 +152,38 @@ app.post('/kakao/skill', async (req, res) => {
 
   if (parsed.isValid) {
     try {
-      // 수정: 한국 시간 타임스탬프 추가
       const timestamp = new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
 
       await saveToSheet({
         name: parsed.name,
+        business: parsed.business, // 웹훅으로 상호명 데이터 전달
         phone: parsed.phone,
         content: parsed.content,
-        timestamp,           // 구글 시트에 접수 시간 기록
+        timestamp,
       });
       console.log('[접수 완료]', parsed);
     } catch (err) {
       console.error('[시트 저장 실패]', err.message);
-      // 저장 실패해도 사용자에게는 접수 완료 안내
     }
 
     return res.json(
       kakaoResponse(
         `✅ 접수되었습니다!\n\n` +
-        `이름/상호명: ${parsed.name}\n` +
+        `이름: ${parsed.name}\n` +
+        `상호명: ${parsed.business}\n` +
         `연락처: ${parsed.phone}\n` +
         `상담내용: ${parsed.content}\n\n` +
         `담당자가 확인 후 연락드리겠습니다. 😊`
       )
     );
   } else {
+    // 양식 검증 실패 시 강제 안내 메시지
     return res.json(
       kakaoResponse(
         `양식에 맞게 접수해 주세요. 🙏\n\n` +
-        `📌 아래 형식으로 입력해 주세요:\n\n` +
-        `이름/상호명: 홍길동\n` +
+        `📌 아래 형식을 복사하여 정확히 입력해 주세요:\n\n` +
+        `이름: 홍길동\n` +
+        `상호명: 길동컴퍼니\n` +
         `연락처: 010-1234-5678\n` +
         `상담내용: 세금계산서 문의`
       )
