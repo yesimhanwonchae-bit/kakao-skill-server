@@ -1,6 +1,6 @@
 // ============================================
 // 카카오 오픈빌더 스킬 서버
-// 기능: 엄격한 상담 접수 양식 검증 + 구글 시트 저장
+// 기능: 슬래시(/) 기반 상담 접수 양식 검증 + 구글 시트 저장
 // 구글 시트 ID: 1fSElgikFPF1Er-SeK4AiCe5FwsKlYeYkE_j7oi7W0UI
 // ============================================
 
@@ -13,49 +13,34 @@ const GOOGLE_SCRIPT_URL = process.env.GOOGLE_SCRIPT_URL || '';
 const PORT = process.env.PORT || 3000;
 
 // ============================================
-// 1. 접수 양식 파싱 함수 (강제 검증 적용)
+// 1. 접수 양식 파싱 함수 (슬래시 기반 검증)
 // ============================================
 function parseInquiry(text) {
   const result = {
     name: null,
-    business: null, // 상호명 필드 추가
+    business: null,
     phone: null,
     content: null,
     isValid: false,
   };
 
-  // 줄바꿈 기준으로 텍스트 분리
-  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-  let contentLines = [];
-  let isContentParsing = false;
+  // 슬래시(/)를 기준으로 텍스트 분리 및 앞뒤 공백 제거
+  const parts = text.split('/').map(p => p.trim());
 
-  for (const line of lines) {
-    // 지정된 키워드와 콜론(:)이 앞부분에 정확히 있는지 정규식으로 검증
-    if (line.match(/^이름\s*[:：]/)) {
-      result.name = line.replace(/^이름\s*[:：]\s*/, '').trim();
-      isContentParsing = false;
-    } else if (line.match(/^상호명\s*[:：]/)) {
-      result.business = line.replace(/^상호명\s*[:：]\s*/, '').trim();
-      isContentParsing = false;
-    } else if (line.match(/^연락처\s*[:：]/)) {
-      result.phone = line.replace(/^연락처\s*[:：]\s*/, '').trim();
-      isContentParsing = false;
-    } else if (line.match(/^상담내용\s*[:：]/)) {
-      contentLines.push(line.replace(/^상담내용\s*[:：]\s*/, '').trim());
-      isContentParsing = true;
-    } else if (isContentParsing) {
-      // '상담내용:' 이후에 입력된 줄바꿈 내용들은 모두 본문에 이어붙임
-      contentLines.push(line);
-    }
+  // 최소 4개의 덩어리가 있어야 함 (이름/상호명/연락처/상담내용)
+  if (parts.length >= 4) {
+    result.name = parts[0];
+    result.business = parts[1];
+    result.phone = parts[2];
+    // 상담내용 뒤쪽에 혹시 모를 슬래시(/)가 더 있더라도 하나로 합쳐줌
+    result.content = parts.slice(3).join('/').trim();
   }
 
-  result.content = contentLines.join('\n').trim();
-
-  // 전화번호 패턴 검증 (기존 로직 유지)
+  // 전화번호 패턴 검증
   const phonePattern = /01[016789]-?\d{3,4}-?\d{4}|0[2-9]\d?-?\d{3,4}-?\d{4}/;
   const isPhoneValid = result.phone && phonePattern.test(result.phone);
 
-  // 4가지 항목이 모두 빈칸 없이 입력되었고, 연락처 형식이 맞을 때만 유효한 것으로 처리
+  // 4가지 항목이 모두 입력되었고, 연락처 형식이 맞을 때만 유효 처리
   result.isValid = !!(result.name && result.business && result.phone && isPhoneValid && result.content);
   
   return result;
@@ -156,7 +141,7 @@ app.post('/kakao/skill', async (req, res) => {
 
       await saveToSheet({
         name: parsed.name,
-        business: parsed.business, // 웹훅으로 상호명 데이터 전달
+        business: parsed.business,
         phone: parsed.phone,
         content: parsed.content,
         timestamp,
@@ -177,15 +162,14 @@ app.post('/kakao/skill', async (req, res) => {
       )
     );
   } else {
-    // 양식 검증 실패 시 강제 안내 메시지
+    // 슬래시 양식 검증 실패 시 안내 메시지 변경
     return res.json(
       kakaoResponse(
         `양식에 맞게 접수해 주세요. 🙏\n\n` +
-        `📌 아래 형식을 복사하여 정확히 입력해 주세요:\n\n` +
-        `이름: 홍길동\n` +
-        `상호명: 길동컴퍼니\n` +
-        `연락처: 010-1234-5678\n` +
-        `상담내용: 세금계산서 문의`
+        `📌 슬래시(/)로 항목을 구분해서 한 줄로 입력해 주셔야 합니다.\n` +
+        `👉 형식: 이름/상호명/연락처/상담내용\n\n` +
+        `📝 예시:\n` +
+        `홍길동/길동컴퍼니/010-1234-5678/세금계산서 발행 문의합니다.`
       )
     );
   }
