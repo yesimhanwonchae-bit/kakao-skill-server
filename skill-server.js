@@ -1,6 +1,7 @@
 // ============================================
 // 카카오 오픈빌더 스킬 서버
 // 기능: 상담 접수 양식 검증 + 구글 시트 저장
+// 구글 시트 ID: 1fSElgikFPF1Er-SeK4AiCe5FwsKlYeYkE_j7oi7W0UI
 // ============================================
 
 const express = require('express');
@@ -8,14 +9,11 @@ const https = require('https');
 const app = express();
 app.use(express.json());
 
-// ✅ 환경변수에서 구글 Apps Script URL 가져오기
-// Railway Variables에 GOOGLE_SCRIPT_URL 등록 필요
 const GOOGLE_SCRIPT_URL = process.env.GOOGLE_SCRIPT_URL || '';
 const PORT = process.env.PORT || 3000;
 
 // ============================================
 // 1. 접수 양식 파싱 함수
-// 이름/상호명, 연락처, 상담내용 추출
 // ============================================
 function parseInquiry(text) {
   const result = {
@@ -25,7 +23,8 @@ function parseInquiry(text) {
     isValid: false,
   };
 
-  const phonePattern = /0\d{1,2}[-.\s]?\d{3,4}[-.\s]?\d{4}/;
+  // 수정: 전화번호 패턴 강화 (010/011/016/017/018/019 휴대폰 + 지역번호)
+  const phonePattern = /01[016789]-?\d{3,4}-?\d{4}|0[2-9]\d?-?\d{3,4}-?\d{4}/;
   const lines = text.split(/[\n,]/).map(l => l.trim()).filter(Boolean);
 
   for (const line of lines) {
@@ -34,7 +33,10 @@ function parseInquiry(text) {
     } else if (/연락처|전화|번호/i.test(line)) {
       result.phone = line.replace(/.*?[：:]\s*/, '').trim();
     } else if (/상담|문의|내용/.test(line)) {
-      result.content = line.replace(/.*?[：:]\s*/, '').trim();
+      // 수정: 상담내용 키워드가 있으면 해당 줄부터 끝까지 합치기
+      const idx = lines.indexOf(line);
+      result.content = lines.slice(idx).map(l => l.replace(/.*?[：:]\s*/, '')).join(' ').trim();
+      break;
     }
   }
 
@@ -46,17 +48,18 @@ function parseInquiry(text) {
     const m = text.match(phonePattern);
     if (m) result.phone = m[0];
   }
+  // 수정: 3번째 줄 이후 전부 합치기 (기존엔 마지막 줄만 가져옴)
   if (!result.content && lines.length >= 3) {
-    result.content = lines[lines.length - 1];
+    result.content = lines.slice(2).join(' ');
   }
 
-  // 유효성 검사: 이름 + 연락처 + 상담내용 모두 있어야 함
   result.isValid = !!(result.name && result.phone && result.content);
   return result;
 }
 
 // ============================================
 // 2. 구글 시트 저장 함수 (Apps Script 웹훅 호출)
+// 수정: 302 리다이렉트 자동 처리 + 타임아웃 4초
 // ============================================
 function saveToSheet(data) {
   return new Promise((resolve, reject) => {
@@ -66,35 +69,55 @@ function saveToSheet(data) {
     }
 
     const body = JSON.stringify(data);
-    const url = new URL(GOOGLE_SCRIPT_URL);
 
-    const options = {
-      hostname: url.hostname,
-      path: url.pathname + url.search,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-      },
-    };
+    function doRequest(targetUrl, attempt) {
+      const url = new URL(targetUrl);
+      const isPost = attempt === 1;
 
-    const req = https.request(options, (res) => {
-      // Apps Script는 302 리다이렉트 응답을 줌 — 성공으로 간주
-      let responseData = '';
-      res.on('data', chunk => responseData += chunk);
-      res.on('end', () => {
-        console.log('[시트 응답]', res.statusCode, responseData.substring(0, 100));
-        resolve(responseData);
+      const options = {
+        hostname: url.hostname,
+        path: url.pathname + url.search,
+        method: isPost ? 'POST' : 'GET',
+        headers: isPost
+          ? {
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(body),
+            }
+          : {},
+      };
+
+      const req = https.request(options, (res) => {
+        // 수정: 302 리다이렉트 → Location 헤더로 재요청
+        if ((res.statusCode === 301 || res.statusCode === 302) && res.headers.location) {
+          console.log('[리다이렉트]', res.statusCode, '→', res.headers.location);
+          return doRequest(res.headers.location, attempt + 1);
+        }
+
+        let responseData = '';
+        res.on('data', chunk => (responseData += chunk));
+        res.on('end', () => {
+          console.log('[시트 응답]', res.statusCode, responseData.substring(0, 100));
+          resolve(responseData);
+        });
       });
-    });
 
-    req.on('error', (err) => {
-      console.error('[시트 저장 오류]', err.message);
-      reject(err);
-    });
+      // 수정: 4초 타임아웃 (카카오 5초 제한 대응)
+      req.setTimeout(4000, () => {
+        console.warn('[타임아웃] 구글 시트 저장 요청 4초 초과');
+        req.destroy();
+        resolve('timeout');
+      });
 
-    req.write(body);
-    req.end();
+      req.on('error', (err) => {
+        console.error('[시트 저장 오류]', err.message);
+        reject(err);
+      });
+
+      if (isPost) req.write(body);
+      req.end();
+    }
+
+    doRequest(GOOGLE_SCRIPT_URL, 1);
   });
 }
 
@@ -103,16 +126,16 @@ function saveToSheet(data) {
 // ============================================
 function kakaoResponse(message) {
   return {
-    version: "2.0",
+    version: '2.0',
     template: {
       outputs: [
         {
           simpleText: {
-            text: message
-          }
-        }
-      ]
-    }
+            text: message,
+          },
+        },
+      ],
+    },
   };
 }
 
@@ -127,12 +150,15 @@ app.post('/kakao/skill', async (req, res) => {
   const parsed = parseInquiry(userText);
 
   if (parsed.isValid) {
-    // ✅ 양식 정상 — 구글 시트 저장 후 접수 완료 안내
     try {
+      // 수정: 한국 시간 타임스탬프 추가
+      const timestamp = new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
+
       await saveToSheet({
         name: parsed.name,
         phone: parsed.phone,
         content: parsed.content,
+        timestamp,           // 구글 시트에 접수 시간 기록
       });
       console.log('[접수 완료]', parsed);
     } catch (err) {
@@ -140,23 +166,25 @@ app.post('/kakao/skill', async (req, res) => {
       // 저장 실패해도 사용자에게는 접수 완료 안내
     }
 
-    return res.json(kakaoResponse(
-      `✅ 접수되었습니다!\n\n` +
-      `이름/상호명: ${parsed.name}\n` +
-      `연락처: ${parsed.phone}\n` +
-      `상담내용: ${parsed.content}\n\n` +
-      `담당자가 확인 후 연락드리겠습니다. 😊`
-    ));
-
+    return res.json(
+      kakaoResponse(
+        `✅ 접수되었습니다!\n\n` +
+        `이름/상호명: ${parsed.name}\n` +
+        `연락처: ${parsed.phone}\n` +
+        `상담내용: ${parsed.content}\n\n` +
+        `담당자가 확인 후 연락드리겠습니다. 😊`
+      )
+    );
   } else {
-    // ❌ 양식 불일치 — 재입력 안내
-    return res.json(kakaoResponse(
-      `양식에 맞게 접수해 주세요. 🙏\n\n` +
-      `📌 아래 형식으로 입력해 주세요:\n\n` +
-      `이름/상호명: 홍길동\n` +
-      `연락처: 010-1234-5678\n` +
-      `상담내용: 세금계산서 문의`
-    ));
+    return res.json(
+      kakaoResponse(
+        `양식에 맞게 접수해 주세요. 🙏\n\n` +
+        `📌 아래 형식으로 입력해 주세요:\n\n` +
+        `이름/상호명: 홍길동\n` +
+        `연락처: 010-1234-5678\n` +
+        `상담내용: 세금계산서 문의`
+      )
+    );
   }
 });
 
